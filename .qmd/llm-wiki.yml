@@ -1,0 +1,22 @@
+global_context: >
+  English wiki for source-grounded knowledge management. Use wiki-index as the
+  catalog-first entrypoint, wiki-sources for per-source English summaries, and
+  wiki-notes for higher-level concepts, comparisons, overviews, entities, and
+  syntheses. This search layer is a discovery aid for wiki/ only and does not
+  replace the raw/, agent/, wiki/ reading order in AGENTS.md.
+collections:
+  wiki-index:
+    path: wiki
+    pattern: index.md
+    context:
+      /: Catalog of the English wiki. Start here to orient on available source pages and higher-level notes.
+  wiki-sources:
+    path: wiki/sources
+    pattern: "**/*.md"
+    context:
+      /: Per-source English summary pages, each mapped to one canonical raw/<source-slug>/ package.
+  wiki-notes:
+    path: wiki/notes
+    pattern: "**/*.md"
+    context:
+      /: Cross-source English notes covering concepts, entities, comparisons, overviews, and syntheses.

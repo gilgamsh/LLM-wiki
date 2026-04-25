@@ -1,0 +1,206 @@
+#!/usr/bin/env python3
+"""Compact old wiki/log.md entries into an active-log rollup.
+
+Dry-run is the default. Pass --write to replace the eligible old entries in
+the target log file with one deterministic rollup entry.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import re
+import sys
+from collections import Counter
+from dataclasses import dataclass
+from pathlib import Path
+
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_LOG_PATH = REPO_ROOT / "wiki" / "log.md"
+ENTRY_RE = re.compile(r"^## \[([0-9]{4}-[0-9]{2}-[0-9]{2})\]\s+([^|\n]+?)\s+\|\s+(.+?)\s*$", re.MULTILINE)
+SOURCE_ID_RE = re.compile(r"\b(?:agent|raw|wiki/sources)/([a-z0-9][a-z0-9-]*-(?:en|zh))(?:/|\.md)\b")
+WIKI_NOTE_RE = re.compile(r"\bwiki/notes/([a-z0-9][a-z0-9-]*\.md)\b")
+BACKTICK_NOTE_RE = re.compile(r"`([a-z0-9][a-z0-9-]*)`\s+(?:concept|comparison|synthesis|overview|entity)\s+note")
+
+
+@dataclass(frozen=True)
+class LogEntry:
+    date: dt.date
+    operation: str
+    subject: str
+    text: str
+
+    @property
+    def heading(self) -> str:
+        return f"{self.date.isoformat()} {self.operation} | {self.subject}"
+
+
+def parse_entries(text: str) -> tuple[str, list[LogEntry]]:
+    matches = list(ENTRY_RE.finditer(text))
+    if not matches:
+        return text.rstrip() + "\n", []
+    preamble = text[: matches[0].start()].rstrip() + "\n\n"
+    entries: list[LogEntry] = []
+    for index, match in enumerate(matches):
+        start = match.start()
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        date_text, operation, subject = match.groups()
+        entries.append(
+            LogEntry(
+                date=dt.date.fromisoformat(date_text),
+                operation=operation.strip(),
+                subject=subject.strip(),
+                text=text[start:end].strip(),
+            )
+        )
+    return preamble, entries
+
+
+def first_retained_index(entries: list[LogEntry], keep_days: int, keep_entries: int, today: dt.date) -> int:
+    cutoff = today - dt.timedelta(days=keep_days)
+    latest_start = max(0, len(entries) - keep_entries)
+    retained = [index for index, entry in enumerate(entries) if index >= latest_start and entry.date >= cutoff]
+    return min(retained) if retained else len(entries)
+
+
+def unique_in_order(items: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for item in items:
+        if item in seen:
+            continue
+        seen.add(item)
+        result.append(item)
+    return result
+
+
+def extract_source_ids(entries: list[LogEntry]) -> list[str]:
+    source_ids: list[str] = []
+    for entry in entries:
+        if entry.operation == "ingest":
+            source_ids.append(entry.subject)
+        source_ids.extend(SOURCE_ID_RE.findall(entry.text))
+    return unique_in_order(source_ids)
+
+
+def extract_note_paths(entries: list[LogEntry]) -> list[str]:
+    notes: list[str] = []
+    for entry in entries:
+        notes.extend(f"wiki/notes/{name}" for name in WIKI_NOTE_RE.findall(entry.text))
+        notes.extend(f"wiki/notes/{name}.md" for name in BACKTICK_NOTE_RE.findall(entry.text))
+    return unique_in_order(notes)
+
+
+def extract_maintenance_items(entries: list[LogEntry]) -> list[str]:
+    items: list[str] = []
+    needles = ("unresolved", "missing", "gap", "contradict", "stale", "TODO")
+    for entry in entries:
+        for line in entry.text.splitlines()[1:]:
+            if any(needle.lower() in line.lower() for needle in needles):
+                items.append(f"{entry.date.isoformat()} {entry.operation} | {entry.subject}: {line.strip()}")
+    return unique_in_order(items)
+
+
+def summarize_values(label: str, values: list[str], empty: str, prefix: str = "`") -> list[str]:
+    if not values:
+        return [f"- {label}: {empty}"]
+    joined = ", ".join(f"{prefix}{value}{prefix}" for value in values)
+    return [f"- {label}: {joined}"]
+
+
+def build_rollup(entries: list[LogEntry], today: dt.date) -> str:
+    if not entries:
+        raise ValueError("cannot roll up zero entries")
+    start = entries[0].date
+    end = entries[-1].date
+    operations = Counter(entry.operation for entry in entries)
+    operation_summary = ", ".join(f"{name} {count}" for name, count in sorted(operations.items()))
+    source_ids = extract_source_ids(entries)
+    note_paths = extract_note_paths(entries)
+    maintenance_items = extract_maintenance_items(entries)
+    body: list[str] = [
+        f"## [{start.isoformat()}] rollup | compacted log entries through {end.isoformat()}",
+        "",
+        f"- Compacted on: {today.isoformat()}",
+        f"- Covered: {len(entries)} entries from {start.isoformat()} to {end.isoformat()}",
+        f"- Operations: {operation_summary}",
+    ]
+    body.extend(summarize_values("Source IDs preserved", source_ids, "none"))
+    body.extend(summarize_values("Wiki notes preserved", note_paths, "none"))
+    if maintenance_items:
+        body.append("- Maintenance signals:")
+        for item in maintenance_items:
+            body.append(f"  - {item}")
+    else:
+        body.append("- Maintenance signals: none visible in compacted entries")
+    body.extend(["", "### Compacted Entries", ""])
+    for entry in entries:
+        body.append(f"- {entry.heading}")
+    return "\n".join(body).rstrip() + "\n"
+
+
+def compact_log(text: str, keep_days: int, keep_entries: int, today: dt.date) -> tuple[str, str, int]:
+    preamble, entries = parse_entries(text)
+    if not entries:
+        return text, "No log entries found.", 0
+    cutoff_index = first_retained_index(entries, keep_days, keep_entries, today)
+    if cutoff_index == 0:
+        return text, "No entries are eligible for compaction.", 0
+    compacted = entries[:cutoff_index]
+    retained = entries[cutoff_index:]
+    rollup = build_rollup(compacted, today)
+    retained_text = "\n\n".join(entry.text for entry in retained)
+    new_text = preamble + rollup
+    if retained_text:
+        new_text += "\n" + retained_text.strip() + "\n"
+    summary = (
+        f"compact {len(compacted)} entries from {compacted[0].date.isoformat()} "
+        f"to {compacted[-1].date.isoformat()} and retain {len(retained)} entries"
+    )
+    return new_text, summary, len(compacted)
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Compact old wiki/log.md entries into a rollup.")
+    parser.add_argument("--write", action="store_true", help="rewrite the target log file; default is dry-run")
+    parser.add_argument("--keep-days", type=int, default=28, help="retain entries from the last N days; default 28")
+    parser.add_argument("--keep-entries", type=int, default=300, help="retain at most the latest N entries; default 300")
+    parser.add_argument("--today", type=dt.date.fromisoformat, default=dt.date.today(), help=argparse.SUPPRESS)
+    parser.add_argument("--log", type=Path, default=DEFAULT_LOG_PATH, help=argparse.SUPPRESS)
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str]) -> int:
+    args = parse_args(argv)
+    if args.keep_days < 0:
+        print("--keep-days must be non-negative", file=sys.stderr)
+        return 2
+    if args.keep_entries < 1:
+        print("--keep-entries must be at least 1", file=sys.stderr)
+        return 2
+    log_path = args.log if args.log.is_absolute() else REPO_ROOT / args.log
+    text = log_path.read_text(encoding="utf-8")
+    new_text, summary, compacted_count = compact_log(text, args.keep_days, args.keep_entries, args.today)
+    if not args.write:
+        print("Dry-run: no files changed.")
+        if compacted_count:
+            print(f"Would {summary}.")
+        else:
+            print(summary)
+        if compacted_count:
+            print()
+            print(new_text, end="")
+        return 0
+    if compacted_count == 0:
+        print(summary)
+        return 0
+    log_path.write_text(new_text, encoding="utf-8")
+    write_summary = summary.removeprefix("compact ").replace(" and retain ", " and retained ")
+    print(f"Compacted {write_summary}.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))
+

@@ -1,0 +1,424 @@
+#!/usr/bin/env python3
+"""Repo-local wiki lint for the LLM-wiki knowledge vault.
+
+The command has two layers:
+- structure: deterministic filesystem and Markdown consistency checks.
+- semantic: an agent-review packet for conflict, stale synthesis, duplicate,
+  unsupported synthesis, and missing bridge-note review.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import re
+import subprocess
+import sys
+from collections import Counter
+from dataclasses import dataclass, field
+from pathlib import Path
+from urllib.parse import unquote, urlparse
+
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+RAW_DIR = REPO_ROOT / "raw"
+AGENT_DIR = REPO_ROOT / "agent"
+WIKI_DIR = REPO_ROOT / "wiki"
+WIKI_SOURCES_DIR = WIKI_DIR / "sources"
+WIKI_NOTES_DIR = WIKI_DIR / "notes"
+WIKI_META_DIR = WIKI_DIR / "meta"
+INDEX_PATH = WIKI_DIR / "index.md"
+LOG_PATH = WIKI_DIR / "log.md"
+VALID_NOTE_TYPES = {"entity", "concept", "comparison", "overview", "synthesis"}
+REQUIRED_AGENT_FILES = ("source.md", "metadata.json", "refs.json")
+LOCAL_LINK_RE = re.compile(r"(?<!!)\[[^\]]+\]\(([^)]+)\)")
+FRONTMATTER_RE = re.compile(r"\A---\n(.*?)\n---\n", re.DOTALL)
+TYPE_RE = re.compile(r"^type:\s*([A-Za-z_-]+)\s*$", re.MULTILINE)
+SOURCE_LINK_RE = re.compile(r"\]\(\.\./sources/[^)]+\.md\)|wiki/sources/[A-Za-z0-9_.\-/]+\.md")
+WORD_RE = re.compile(r"[a-z0-9]+")
+BACKTICK_TERM_RE = re.compile(r"`([^`\n]{2,60})`")
+
+
+@dataclass
+class Finding:
+    level: str
+    message: str
+    path: str | None = None
+
+    def render(self) -> str:
+        prefix = f"- {self.level}: "
+        if self.path:
+            return f"{prefix}`{self.path}` - {self.message}"
+        return f"{prefix}{self.message}"
+
+
+@dataclass
+class LintResult:
+    structure: list[Finding] = field(default_factory=list)
+    semantic: list[str] = field(default_factory=list)
+    qmd_status: str = ""
+
+    def counts(self) -> Counter:
+        counts: Counter = Counter()
+        for finding in self.structure:
+            counts[finding.level] += 1
+        return counts
+
+
+def rel(path: Path) -> str:
+    return path.relative_to(REPO_ROOT).as_posix()
+
+
+def read_text(path: Path) -> str:
+    return path.read_text(encoding="utf-8")
+
+
+def wiki_source_files() -> list[Path]:
+    return sorted(WIKI_SOURCES_DIR.glob("*.md"))
+
+
+def wiki_note_files() -> list[Path]:
+    return sorted(path for path in WIKI_NOTES_DIR.glob("*.md") if path.name != ".gitkeep")
+
+
+def parse_note_type(text: str) -> str | None:
+    frontmatter = FRONTMATTER_RE.match(text)
+    if not frontmatter:
+        return None
+    match = TYPE_RE.search(frontmatter.group(1))
+    if not match:
+        return None
+    return match.group(1)
+
+
+def is_external_link(target: str) -> bool:
+    parsed = urlparse(target)
+    return parsed.scheme in {"http", "https", "mailto", "tel"}
+
+
+def normalize_link_target(target: str) -> str:
+    target = target.strip()
+    if target.startswith("<") and target.endswith(">"):
+        target = target[1:-1]
+    target = target.split("#", 1)[0]
+    return unquote(target)
+
+
+def resolve_local_link(source_file: Path, target: str) -> Path | None:
+    target = normalize_link_target(target)
+    if not target or is_external_link(target):
+        return None
+    if target.startswith("/"):
+        return REPO_ROOT / target.lstrip("/")
+    return (source_file.parent / target).resolve()
+
+
+def check_local_links(path: Path, findings: list[Finding]) -> None:
+    text = read_text(path)
+    for match in LOCAL_LINK_RE.finditer(text):
+        target = match.group(1)
+        resolved = resolve_local_link(path, target)
+        if resolved is None:
+            continue
+        try:
+            resolved.relative_to(REPO_ROOT)
+        except ValueError:
+            findings.append(Finding("ERROR", f"local link escapes repo: `{target}`", rel(path)))
+            continue
+        if not resolved.exists():
+            findings.append(Finding("ERROR", f"broken local link target: `{target}`", rel(path)))
+
+
+def check_sources(findings: list[Finding]) -> None:
+    index_text = read_text(INDEX_PATH) if INDEX_PATH.exists() else ""
+    log_text = read_text(LOG_PATH) if LOG_PATH.exists() else ""
+    for source_page in wiki_source_files():
+        slug = source_page.stem
+        raw_dir = RAW_DIR / slug
+        agent_dir = AGENT_DIR / slug
+        if not raw_dir.is_dir():
+            findings.append(Finding("ERROR", "missing matching raw source directory", rel(source_page)))
+        if not agent_dir.is_dir():
+            findings.append(Finding("ERROR", "missing matching agent package directory", rel(source_page)))
+            continue
+        for filename in REQUIRED_AGENT_FILES:
+            if not (agent_dir / filename).is_file():
+                findings.append(Finding("ERROR", f"missing required agent package file `{filename}`", rel(agent_dir)))
+        if not (agent_dir / "images").is_dir():
+            findings.append(Finding("WARN", "missing optional `images/` directory", rel(agent_dir)))
+        check_metadata(slug, agent_dir, findings)
+        if slug not in index_text:
+            findings.append(Finding("ERROR", "source page missing from wiki index", rel(source_page)))
+        if slug not in log_text:
+            findings.append(Finding("WARN", "source slug not found in active wiki log or rollup", rel(source_page)))
+
+
+def check_metadata(slug: str, agent_dir: Path, findings: list[Finding]) -> None:
+    metadata_path = agent_dir / "metadata.json"
+    if not metadata_path.is_file():
+        return
+    try:
+        data = json.loads(read_text(metadata_path))
+    except json.JSONDecodeError as exc:
+        findings.append(Finding("ERROR", f"invalid JSON metadata: {exc}", rel(metadata_path)))
+        return
+    expected = {
+        "source_id": slug,
+        "raw_dir": f"raw/{slug}",
+        "agent_dir": f"agent/{slug}",
+    }
+    for key, value in expected.items():
+        if data.get(key) != value:
+            findings.append(Finding("ERROR", f"metadata `{key}` is `{data.get(key)}`, expected `{value}`", rel(metadata_path)))
+
+
+def check_notes(findings: list[Finding]) -> None:
+    index_text = read_text(INDEX_PATH) if INDEX_PATH.exists() else ""
+    for note in wiki_note_files():
+        note_type = parse_note_type(read_text(note))
+        if note_type not in VALID_NOTE_TYPES:
+            findings.append(
+                Finding(
+                    "ERROR",
+                    f"frontmatter type must be one of `{sorted(VALID_NOTE_TYPES)}`, found `{note_type}`",
+                    rel(note),
+                )
+            )
+        if note.stem not in index_text:
+            findings.append(Finding("ERROR", "note page missing from wiki index", rel(note)))
+
+
+def run_qmd_status() -> str:
+    wrapper = REPO_ROOT / "scripts" / "qmd-wiki"
+    if not wrapper.is_file():
+        return "QMD wrapper missing: `scripts/qmd-wiki`"
+    try:
+        completed = subprocess.run(
+            [str(wrapper), "status"],
+            cwd=REPO_ROOT,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=90,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return f"QMD status unavailable: {exc}"
+    return completed.stdout.strip()
+
+
+def structural_lint(include_qmd: bool) -> tuple[list[Finding], str]:
+    findings: list[Finding] = []
+    for required in (RAW_DIR, AGENT_DIR, WIKI_DIR, WIKI_SOURCES_DIR, WIKI_NOTES_DIR, INDEX_PATH, LOG_PATH):
+        if not required.exists():
+            findings.append(
+                Finding(
+                    "ERROR",
+                    "required path is missing",
+                    rel(required) if required.is_relative_to(REPO_ROOT) else str(required),
+                )
+            )
+    if findings:
+        return findings, ""
+    check_sources(findings)
+    check_notes(findings)
+    for path in [*wiki_source_files(), *wiki_note_files(), INDEX_PATH]:
+        check_local_links(path, findings)
+    qmd_status = run_qmd_status() if include_qmd else "Skipped by command option."
+    return findings, qmd_status
+
+
+def tokenize_stem(stem: str) -> set[str]:
+    stop = {"and", "for", "from", "with", "into", "agent", "agents", "llm", "en", "zh", "vs"}
+    return {word for word in stem.split("-") if len(word) > 2 and word not in stop}
+
+
+def duplicate_note_candidates(notes: list[Path], limit: int = 20) -> list[tuple[float, Path, Path]]:
+    scored: list[tuple[float, Path, Path]] = []
+    for index, left in enumerate(notes):
+        left_tokens = tokenize_stem(left.stem)
+        if not left_tokens:
+            continue
+        for right in notes[index + 1 :]:
+            right_tokens = tokenize_stem(right.stem)
+            if not right_tokens:
+                continue
+            union = left_tokens | right_tokens
+            overlap = left_tokens & right_tokens
+            score = len(overlap) / len(union)
+            if score >= 0.25 and overlap:
+                scored.append((score, left, right))
+    return sorted(scored, reverse=True, key=lambda item: item[0])[:limit]
+
+
+def unsupported_synthesis_candidates(notes: list[Path], limit: int = 20) -> list[tuple[int, Path]]:
+    candidates: list[tuple[int, Path]] = []
+    for note in notes:
+        text = read_text(note)
+        if parse_note_type(text) not in {"concept", "comparison", "overview", "synthesis"}:
+            continue
+        paragraphs = [part.strip() for part in re.split(r"\n\s*\n", text) if part.strip()]
+        claim_like = [
+            part
+            for part in paragraphs
+            if len(part) > 180
+            and not part.startswith("---")
+            and not part.startswith("#")
+            and not SOURCE_LINK_RE.search(part)
+        ]
+        if claim_like:
+            candidates.append((len(claim_like), note))
+    return sorted(candidates, reverse=True)[:limit]
+
+
+def repeated_terms_without_notes(paths: list[Path], notes: list[Path], limit: int = 20) -> list[tuple[str, int]]:
+    note_stems = {note.stem for note in notes}
+    generic_terms = {"llm", "llms", "ai", "gpt-4"}
+    counter: Counter[str] = Counter()
+    for path in paths:
+        text = read_text(path)
+        for term in BACKTICK_TERM_RE.findall(text):
+            normalized = "-".join(WORD_RE.findall(term.lower()))
+            if len(normalized) < 3:
+                continue
+            counter[normalized] += 1
+    results = []
+    for term, count in counter.most_common():
+        if count < 3:
+            continue
+        if term in generic_terms:
+            continue
+        if term not in note_stems and not any(term in stem for stem in note_stems):
+            results.append((term, count))
+        if len(results) >= limit:
+            break
+    return results
+
+
+def semantic_review_packet() -> list[str]:
+    notes = wiki_note_files()
+    sources = wiki_source_files()
+    lines: list[str] = [
+        "## Semantic Review Packet",
+        "",
+        "This section is intentionally agent-reviewed. The script gathers candidates; the reviewing agent must use targeted search and page reads before writing final semantic findings.",
+        "",
+        "### Required Review Questions",
+        "",
+        "- Hidden conflicts: are incompatible claims explicitly discussed, scoped, or marked unresolved?",
+        "- Stale synthesis: do overview and synthesis notes reflect newer source pages that materially sharpen or contradict them?",
+        "- Unsupported synthesis: do strong wiki-note claims point to source pages?",
+        "- Duplicate-note risk: are overlapping notes merged, cross-linked, or clearly scoped?",
+        "- Missing bridge notes: do repeated cross-source ideas have reusable notes when they should?",
+        "",
+        "### Duplicate-Note Candidates",
+        "",
+    ]
+    duplicates = duplicate_note_candidates(notes)
+    if duplicates:
+        for score, left, right in duplicates:
+            lines.append(f"- review {score:.2f}: `{rel(left)}` and `{rel(right)}`")
+    else:
+        lines.append("- no filename-overlap candidates found")
+    lines.extend(["", "### Unsupported-Synthesis Candidates", ""])
+    unsupported = unsupported_synthesis_candidates(notes)
+    if unsupported:
+        for count, note in unsupported:
+            lines.append(f"- review `{rel(note)}`: {count} long paragraph(s) without direct source-page links")
+    else:
+        lines.append("- no long unsourced paragraph candidates found")
+    lines.extend(["", "### Stale-Synthesis Review Targets", ""])
+    targets = [note for note in notes if parse_note_type(read_text(note)) in {"overview", "synthesis"}]
+    if targets:
+        for note in targets:
+            lines.append(f"- review `{rel(note)}` against newer and related `wiki/sources/` pages")
+    else:
+        lines.append("- no overview or synthesis notes found")
+    lines.extend(["", "### Missing Bridge-Note Candidates", ""])
+    repeated_terms = repeated_terms_without_notes([*sources, *notes], notes)
+    if repeated_terms:
+        for term, count in repeated_terms:
+            lines.append(f"- review `{term}`: appears as a backtick term {count} times but has no same-name note")
+    else:
+        lines.append("- no repeated backtick-term candidates found")
+    lines.extend(["", "### Review Procedure", ""])
+    lines.append("- Start from `wiki/index.md`, then use repo-local search (if configured) for discovery.")
+    lines.append("- Read exact source and note pages before recording any semantic finding.")
+    lines.append("- Treat conflicts as healthy when they are visible; only hidden or unsupported conflicts are lint issues.")
+    lines.append("- Do not auto-fix from this report; update the relevant wiki note deliberately after review.")
+    return lines
+
+
+def render_report(mode: str, result: LintResult) -> str:
+    today = dt.date.today().isoformat()
+    counts = result.counts()
+    lines = [
+        "---",
+        "type: meta",
+        f'title: \"Wiki Lint Report {today}\"',
+        f"created: {today}",
+        f"updated: {today}",
+        "status: generated",
+        "---",
+        "",
+        f"# Wiki Lint Report: {today}",
+        "",
+        "## Summary",
+        "",
+        f"- Mode: `{mode}`",
+        f"- Structural errors: {counts['ERROR']}",
+        f"- Structural warnings: {counts['WARN']}",
+        f"- Structural info: {counts['INFO']}",
+        "- Semantic lint: agent-reviewed candidate packet, not automated judgment",
+        "",
+    ]
+    if mode in {"structure", "all"}:
+        lines.extend(["## Structural Findings", ""])
+        if result.structure:
+            lines.extend(finding.render() for finding in result.structure)
+        else:
+            lines.append("- PASS: no structural findings")
+        lines.extend(["", "## QMD Status", "", "```text", result.qmd_status or "Not run.", "```", ""])
+    if mode in {"semantic", "all"}:
+        lines.extend(result.semantic)
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def report_path_for_today() -> Path:
+    today = dt.date.today().isoformat()
+    return WIKI_META_DIR / f"wiki-lint-{today}.md"
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Lint the LLM-wiki.")
+    parser.add_argument("mode", choices=("structure", "semantic", "all"), help="lint layer to run")
+    parser.add_argument("--stdout", action="store_true", help="print report without writing wiki/meta")
+    parser.add_argument("--output", type=Path, help="custom report path; defaults to wiki/meta/wiki-lint-YYYY-MM-DD.md")
+    parser.add_argument("--no-qmd", action="store_true", help="skip scripts/qmd-wiki status in structural lint")
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str]) -> int:
+    args = parse_args(argv)
+    result = LintResult()
+    if args.mode in {"structure", "all"}:
+        result.structure, result.qmd_status = structural_lint(include_qmd=not args.no_qmd)
+    if args.mode in {"semantic", "all"}:
+        result.semantic = semantic_review_packet()
+    report = render_report(args.mode, result)
+    if args.stdout:
+        print(report, end="")
+    else:
+        output_path = args.output if args.output else report_path_for_today()
+        output_path = output_path if output_path.is_absolute() else REPO_ROOT / output_path
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(report, encoding="utf-8")
+        print(rel(output_path))
+    return 1 if any(finding.level == "ERROR" for finding in result.structure) else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))
+

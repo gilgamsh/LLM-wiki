@@ -1,0 +1,19 @@
+{
+  "source_id": "example-source-slug",
+  "references": [
+    {
+      "ref_id": "1",
+      "marker": "[1]",
+      "text": "Example reference text.",
+      "source_file": "paper.pdf"
+    }
+  ],
+  "footnotes": [
+    {
+      "footnote_id": "fn-1",
+      "marker": "[^1]",
+      "text": "Example footnote text.",
+      "source_file": "paper.pdf"
+    }
+  ]
+}

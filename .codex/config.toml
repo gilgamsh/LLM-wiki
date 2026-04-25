@@ -1,0 +1,5 @@
+[mcp_servers.qmd-wiki]
+command = "./scripts/qmd-wiki"
+args = ["mcp"]
+cwd = "."
+tool_timeout_sec = 90
