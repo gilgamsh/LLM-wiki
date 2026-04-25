@@ -12,7 +12,7 @@ This repository standardizes a simple workflow that turns raw materials into (1)
 
 ## Credits
 
-This template is inspired by Andrej Karpathy’s “LLM Wiki” concept: `https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f`.
+This template is inspired by Andrej Karpathy’s [“LLM Wiki” concept](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f).
 
 ## Quick start
 
