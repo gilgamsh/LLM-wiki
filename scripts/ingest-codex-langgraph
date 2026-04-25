@@ -1,0 +1,713 @@
+#!/usr/bin/env python3
+"""Run queued source ingests through Codex under a LangGraph controller."""
+
+from __future__ import annotations
+
+import argparse
+from contextlib import contextmanager
+import datetime as dt
+import fcntl
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+from typing import Iterator, TextIO, TypedDict
+
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+QUEUE_PATH = REPO_ROOT / "ingest-order.md"
+RUNNER_REL_PATH = "scripts/ingest-codex-langgraph"
+EVENT_LOG_DIR = REPO_ROOT / "wiki" / "meta" / "codex-events"
+RUNNER_LOCK_PATH = REPO_ROOT / ".qmd" / "ingest-codex-langgraph.pid"
+RUNNER_LOCK_BUSY_EXIT_CODE = 3
+QUEUE_ITEM_RE = re.compile(r"^-\s+`([^`]+)`\s*$", re.MULTILINE)
+
+
+class CommandResult(TypedDict):
+    command: list[str]
+    returncode: int
+    stdout: str
+    last_message: str
+    event_log: str
+
+
+class RunnerState(TypedDict, total=False):
+    repo_root: str
+    limit: int
+    model: str | None
+    quality_review: bool
+    dry_run: bool
+    event_log: bool
+    event_log_dir: str
+    event_summary: bool
+    completed: int
+    slug: str | None
+    queue_before: list[str]
+    expected_queue_after: list[str]
+    status_before: set[str]
+    status_after: set[str]
+    logs: list[str]
+    planned_commands: list[list[str]]
+    event_logs: list[str]
+    error: str | None
+    stop: bool
+
+
+class RunnerLockBusy(RuntimeError):
+    def __init__(self, lock_path: Path, lock_text: str) -> None:
+        self.lock_path = lock_path
+        self.lock_text = lock_text
+        super().__init__(self.message())
+
+    def message(self) -> str:
+        relative_lock_path = display_path(self.lock_path)
+        message = f"Another {RUNNER_REL_PATH} runner is already running; lock held at `{relative_lock_path}`."
+        if self.lock_text:
+            message += f"\nLock holder:\n{self.lock_text}"
+        return message
+
+
+def import_langgraph() -> tuple[object, str]:
+    try:
+        from langgraph.graph import END, StateGraph
+    except ImportError:
+        print(
+            "Missing dependency: install LangGraph with `pip install -U langgraph langchain`.",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+    return StateGraph, END
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Ingest queued papers through Codex and LangGraph.")
+    parser.add_argument("--limit", type=int, default=1, help="maximum queued papers to ingest; default 1")
+    parser.add_argument("--dry-run", action="store_true", help="print the next slug and planned commands")
+    parser.add_argument("--model", help="forward a Codex model override")
+    parser.add_argument(
+        "--quality-review",
+        action="store_true",
+        help="opt in to source-quality scoring, triage, mini-reviews, and reviews/ edits during ingest",
+    )
+    parser.add_argument("--event-log", action="store_true", help="write Codex JSONL events to a log file")
+    parser.add_argument(
+        "--event-log-dir",
+        default=EVENT_LOG_DIR.as_posix(),
+        help="directory for Codex JSONL event logs when --event-log is enabled",
+    )
+    parser.add_argument(
+        "--no-event-summary",
+        dest="event_summary",
+        action="store_false",
+        help="suppress compact Codex event summaries on stdout",
+    )
+    parser.set_defaults(event_summary=True)
+    return parser.parse_args(argv)
+
+
+def read_queue() -> list[str]:
+    if not QUEUE_PATH.is_file():
+        raise FileNotFoundError(f"missing queue file: {QUEUE_PATH.relative_to(REPO_ROOT)}")
+    return QUEUE_ITEM_RE.findall(QUEUE_PATH.read_text(encoding="utf-8"))
+
+
+def lock_metadata() -> str:
+    started_at = dt.datetime.now(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return "\n".join(
+        (
+            f"pid: {os.getpid()}",
+            f"started_at_utc: {started_at}",
+            f"repo_root: {REPO_ROOT}",
+        )
+    )
+
+
+def read_lock_text(lock_file: TextIO) -> str:
+    lock_file.seek(0)
+    return lock_file.read().strip()
+
+
+@contextmanager
+def singleton_runner_lock() -> Iterator[None]:
+    RUNNER_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with RUNNER_LOCK_PATH.open("a+", encoding="utf-8") as lock_file:
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise RunnerLockBusy(RUNNER_LOCK_PATH, read_lock_text(lock_file)) from exc
+        lock_file.seek(0)
+        lock_file.truncate()
+        lock_file.write(lock_metadata())
+        lock_file.write("\n")
+        lock_file.flush()
+        try:
+            yield
+        finally:
+            lock_file.seek(0)
+            lock_file.truncate()
+            lock_file.flush()
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def run_command(command: list[str], timeout: int | None = None) -> CommandResult:
+    completed = subprocess.run(
+        command,
+        cwd=REPO_ROOT,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        timeout=timeout,
+        check=False,
+    )
+    return {
+        "command": command,
+        "returncode": completed.returncode,
+        "stdout": completed.stdout,
+        "last_message": "",
+        "event_log": "",
+    }
+
+
+def summarize_codex_event(line: str) -> str | None:
+    try:
+        event = json.loads(line)
+    except json.JSONDecodeError:
+        return line.strip() or None
+    event_type = event.get("type")
+    if event_type == "thread.started":
+        return f"codex thread started: {event.get('thread_id', 'unknown')}"
+    if event_type == "turn.started":
+        return "codex turn started"
+    if event_type == "turn.completed":
+        usage = event.get("usage") or {}
+        input_tokens = usage.get("input_tokens")
+        output_tokens = usage.get("output_tokens")
+        reasoning_tokens = usage.get("reasoning_output_tokens")
+        if input_tokens is None:
+            return "codex turn completed"
+        return (
+            "codex turn completed: "
+            f"input={input_tokens}, output={output_tokens}, reasoning={reasoning_tokens}"
+        )
+    if event_type == "item.completed":
+        item = event.get("item") or {}
+        item_type = item.get("type")
+        if item_type == "agent_message":
+            text = re.sub(r"\s+", " ", item.get("text", "")).strip()
+            if len(text) > 140:
+                text = text[:137].rstrip() + "..."
+            return f"codex agent message: {text}" if text else "codex agent message completed"
+        if item_type == "command_execution":
+            command = item.get("command") or item.get("cmd") or item.get("arguments")
+            status = item.get("status") or item.get("exit_code") or "completed"
+            return f"codex command {status}: {command}" if command else f"codex command {status}"
+        if item_type == "file_change":
+            path = item.get("path") or item.get("file") or item.get("file_path")
+            return f"codex file change: {path}" if path else "codex file change completed"
+        return f"codex item completed: {item_type or 'unknown'}"
+    if event_type == "error":
+        message = event.get("message") or event.get("error") or line.strip()
+        return f"codex error: {message}"
+    return None
+
+
+def resolve_event_log_dir(path_text: str) -> Path:
+    path = Path(path_text).expanduser()
+    if not path.is_absolute():
+        path = REPO_ROOT / path
+    return path
+
+
+def display_path(path: Path) -> str:
+    try:
+        return path.resolve().relative_to(REPO_ROOT).as_posix()
+    except ValueError:
+        return path.resolve().as_posix()
+
+
+def event_log_path(slug: str, phase: str, event_log_dir: Path) -> Path:
+    timestamp = dt.datetime.now(dt.UTC).strftime("%Y%m%dT%H%M%SZ")
+    event_log_dir.mkdir(parents=True, exist_ok=True)
+    return event_log_dir / f"{timestamp}-{slug}-{phase}.jsonl"
+
+
+def run_codex(
+    prompt: str,
+    model: str | None,
+    slug: str,
+    phase: str,
+    write_event_log: bool,
+    event_log_dir: str,
+    event_summary: bool,
+    timeout: int | None = None,
+) -> CommandResult:
+    with tempfile.NamedTemporaryFile(prefix="codex-ingest-", suffix=".txt", delete=False) as output_file:
+        output_path = Path(output_file.name)
+    jsonl_path = event_log_path(slug, phase, resolve_event_log_dir(event_log_dir)) if write_event_log else None
+    command = [
+        "codex",
+        "exec",
+        "--cd",
+        str(REPO_ROOT),
+        "--sandbox",
+        "workspace-write",
+        "--json",
+        "--output-last-message",
+        str(output_path),
+    ]
+    if model:
+        command.extend(["--model", model])
+    command.append(prompt)
+    try:
+        process = subprocess.Popen(
+            command,
+            cwd=REPO_ROOT,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+        stdout_lines: list[str] = []
+        assert process.stdout is not None
+        jsonl_file = None
+        try:
+            if jsonl_path:
+                jsonl_file = jsonl_path.open("w", encoding="utf-8")
+            for line in process.stdout:
+                stdout_lines.append(line)
+                if jsonl_file:
+                    jsonl_file.write(line)
+                    jsonl_file.flush()
+                summary = summarize_codex_event(line)
+                if event_summary and summary:
+                    print(f"[codex] {summary}", flush=True)
+            returncode = process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            returncode = process.wait()
+            stdout_lines.append(f"\nTimed out after {timeout} seconds.\n")
+        finally:
+            if jsonl_file:
+                jsonl_file.close()
+        if jsonl_path:
+            print(f"[codex] event log: {display_path(jsonl_path)}", flush=True)
+        result: CommandResult = {
+            "command": command,
+            "returncode": returncode,
+            "stdout": "".join(stdout_lines),
+            "last_message": "",
+            "event_log": display_path(jsonl_path) if jsonl_path else "",
+        }
+        if output_path.exists():
+            result["last_message"] = output_path.read_text(encoding="utf-8", errors="replace")
+        return result
+    finally:
+        try:
+            output_path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def git_status_paths() -> set[str]:
+    result = run_command(["git", "status", "--porcelain=v1", "--untracked-files=all"], timeout=60)
+    if result["returncode"] != 0:
+        raise RuntimeError(f"git status failed:\n{result['stdout']}")
+    paths: set[str] = set()
+    for line in result["stdout"].splitlines():
+        if len(line) < 4:
+            continue
+        path_text = line[3:]
+        if " -> " in path_text:
+            paths.update(part.strip('"') for part in path_text.split(" -> ", 1))
+        else:
+            paths.add(path_text.strip('"'))
+    return paths
+
+
+def is_allowed_event_log_path(path: str, event_log_dir: str) -> bool:
+    resolved_dir = resolve_event_log_dir(event_log_dir).resolve()
+    try:
+        rel_dir = resolved_dir.relative_to(REPO_ROOT).as_posix()
+    except ValueError:
+        return False
+    rel_dir = rel_dir.rstrip("/")
+    return path.startswith(f"{rel_dir}/")
+
+
+def is_allowed_path(path: str, slug: str, event_log_dir: str, quality_review: bool = False) -> bool:
+    allowed_exact = {"ingest-order.md", RUNNER_REL_PATH}
+    allowed_prefixes = (f"agent/{slug}/", "wiki/", ".qmd/")
+    return (
+        path in allowed_exact
+        or path.startswith(allowed_prefixes)
+        or (quality_review and path.startswith("reviews/"))
+        or is_allowed_event_log_path(path, event_log_dir)
+    )
+
+
+def command_for_display(command: list[str]) -> str:
+    return " ".join(command[:-1] + ["<prompt>"] if command and command[0] == "codex" else command)
+
+
+def planned_codex_command(model: str | None) -> list[str]:
+    command = [
+        "codex",
+        "exec",
+        "--cd",
+        str(REPO_ROOT),
+        "--sandbox",
+        "workspace-write",
+        "--json",
+        "--output-last-message",
+        "<tmpfile>",
+    ]
+    if model:
+        command.extend(["--model", model])
+    command.append("<prompt>")
+    return command
+
+
+def append_log(state: RunnerState, message: str) -> RunnerState:
+    state.setdefault("logs", []).append(message)
+    return state
+
+
+def fail(state: RunnerState, message: str) -> RunnerState:
+    state["error"] = message
+    state["stop"] = True
+    append_log(state, f"FAIL: {message}")
+    return state
+
+
+def worker_prompt(quality_review: bool) -> str:
+    if quality_review:
+        quality_instruction = """Apply `resource-quality-policy.md` during this ingest. Record any source-quality scoring, triage, mini-review, or author/lab provenance review only under `reviews/`; keep those judgments out of `agent/metadata.json`, `refs.json`, and public `wiki/sources/` pages."""
+    else:
+        quality_instruction = """Treat queued canonical `raw/<slug>/` items as already selected for ingest. Do not perform `resource-quality-policy.md` scoring, triage, reviewer-style mini-reviews, author/lab provenance review, or edit `reviews/` unless the user explicitly asked for source-quality review."""
+    return f"""according to `ingest-order.md`, first ingest the first queued source slug, then remove it from `ingest-order.md`.
+{quality_instruction}
+Stop and report failure if you cannot complete the ingest safely.
+"""
+
+
+def read_queue_node(state: RunnerState) -> RunnerState:
+    if state.get("completed", 0) >= state["limit"]:
+        state["stop"] = True
+        return append_log(state, f"Reached limit {state['limit']}.")
+    try:
+        queue = read_queue()
+        status_before = git_status_paths()
+    except Exception as exc:
+        return fail(state, str(exc))
+    if not queue:
+        state["stop"] = True
+        state["slug"] = None
+        state["queue_before"] = []
+        state["expected_queue_after"] = []
+        state["status_before"] = status_before
+        return append_log(state, "Queue is empty.")
+    state["slug"] = None
+    state["queue_before"] = queue
+    state["expected_queue_after"] = []
+    state["status_before"] = status_before
+    append_log(state, "Queue has pending source slugs.")
+    if state["dry_run"]:
+        event_log_message = "JSONL event logging enabled."
+        if not state.get("event_log"):
+            event_log_message = "JSONL event logging disabled."
+        elif state.get("event_log_dir"):
+            event_log_message = f"JSONL event logging enabled at {display_path(resolve_event_log_dir(state['event_log_dir']))}."
+        append_log(state, event_log_message)
+        event_summary_message = "Codex event summaries enabled."
+        if not state.get("event_summary", True):
+            event_summary_message = "Codex event summaries disabled."
+        append_log(state, event_summary_message)
+        if state.get("quality_review"):
+            append_log(state, "Source quality review enabled.")
+        else:
+            append_log(state, "Source quality review disabled.")
+        state["planned_commands"] = [
+            planned_codex_command(state.get("model")),
+            ["scripts/wiki-lint", "structure", "--stdout"],
+            ["scripts/wiki-lint", "semantic", "--stdout"],
+            ["scripts/qmd-wiki", "update"],
+            ["scripts/qmd-wiki", "status"],
+            ["scripts/qmd-wiki", "embed", "(if status reports missing embeddings)"],
+        ]
+        state["stop"] = True
+    return state
+
+
+def run_codex_ingest_node(state: RunnerState) -> RunnerState:
+    if state.get("stop"):
+        return state
+    queue_before = state.get("queue_before", [])
+    if not queue_before:
+        return fail(state, "no queued slug to ingest")
+    result = run_codex(
+        worker_prompt(state.get("quality_review", False)),
+        state.get("model"),
+        "queued-source",
+        "ingest",
+        state.get("event_log", False),
+        state.get("event_log_dir", EVENT_LOG_DIR.as_posix()),
+        state.get("event_summary", True),
+    )
+    append_log(state, f"Codex ingest exited {result['returncode']}.")
+    if result["event_log"]:
+        state.setdefault("event_logs", []).append(result["event_log"])
+    if result["returncode"] != 0:
+        return fail(state, f"Codex ingest failed:\n{result['stdout']}\n{result['last_message']}")
+    try:
+        queue_after = read_queue()
+    except Exception as exc:
+        return fail(state, str(exc))
+    expected_queue_after = queue_before[1:]
+    slug = queue_before[0]
+    if queue_after != expected_queue_after:
+        return fail(state, "`ingest-order.md` did not remove exactly the first queued slug and preserve the remaining queue")
+    state["slug"] = slug
+    state["expected_queue_after"] = expected_queue_after
+    append_log(state, f"Ingested queue slug: {slug}.")
+    return state
+
+
+def run_lint(command: list[str]) -> tuple[bool, str]:
+    result = run_command(command, timeout=180)
+    output = result["stdout"].strip()
+    if result["returncode"] != 0:
+        return False, f"`{command_for_display(command)}` failed:\n{output}"
+    return True, output
+
+
+def verify_completed_slug(slug: str, expected_queue_after: list[str]) -> list[str]:
+    errors: list[str] = []
+    for path in (
+        REPO_ROOT / "agent" / slug / "source.md",
+        REPO_ROOT / "agent" / slug / "metadata.json",
+        REPO_ROOT / "agent" / slug / "refs.json",
+        REPO_ROOT / "wiki" / "sources" / f"{slug}.md",
+    ):
+        if not path.is_file():
+            errors.append(f"missing required artifact `{path.relative_to(REPO_ROOT)}`")
+    try:
+        queue_after = read_queue()
+    except Exception as exc:
+        errors.append(str(exc))
+        return errors
+    if slug in queue_after:
+        errors.append(f"`ingest-order.md` still contains completed slug `{slug}`")
+    if queue_after != expected_queue_after:
+        errors.append("`ingest-order.md` did not preserve the remaining queue exactly")
+    return errors
+
+
+def run_checks_node(state: RunnerState) -> RunnerState:
+    if state.get("stop"):
+        return state
+    slug = state.get("slug")
+    if not slug:
+        return fail(state, "no slug available for checks")
+    for command in (
+        ["scripts/wiki-lint", "structure", "--stdout"],
+        ["scripts/wiki-lint", "semantic", "--stdout"],
+    ):
+        ok, output = run_lint(command)
+        append_log(state, f"Ran {command_for_display(command)}.")
+        if not ok:
+            return fail(state, output)
+    verification_errors = verify_completed_slug(slug, state["expected_queue_after"])
+    if verification_errors:
+        return fail(state, "\n".join(verification_errors))
+    try:
+        state["status_after"] = git_status_paths()
+    except Exception as exc:
+        return fail(state, str(exc))
+    append_log(state, f"Verified required artifacts and queue update for {slug}.")
+    return state
+
+
+def qmd_status_has_missing_embeddings(status_output: str) -> bool:
+    lowered = status_output.lower()
+    missing_markers = (
+        "missing embedding",
+        "missing embeddings",
+        "unembedded",
+        "not embedded",
+        "pending embedding",
+        "needs embedding",
+        "need embedding",
+    )
+    return any(marker in lowered for marker in missing_markers)
+
+
+def refresh_qmd_node(state: RunnerState) -> RunnerState:
+    if state.get("stop"):
+        return state
+    for command in (["scripts/qmd-wiki", "update"], ["scripts/qmd-wiki", "status"]):
+        result = run_command(command, timeout=300)
+        append_log(state, f"Ran {command_for_display(command)}.")
+        if result["returncode"] != 0:
+            return fail(state, f"`{command_for_display(command)}` failed:\n{result['stdout']}")
+        if command[-1] == "status":
+            status_output = result["stdout"]
+            if qmd_status_has_missing_embeddings(status_output):
+                embed_result = run_command(["scripts/qmd-wiki", "embed"], timeout=None)
+                append_log(state, "Ran scripts/qmd-wiki embed.")
+                if embed_result["returncode"] != 0:
+                    return fail(state, f"`scripts/qmd-wiki embed` failed:\n{embed_result['stdout']}")
+                final_status = run_command(["scripts/qmd-wiki", "status"], timeout=300)
+                append_log(state, "Rechecked scripts/qmd-wiki status.")
+                if final_status["returncode"] != 0:
+                    return fail(state, f"`scripts/qmd-wiki status` failed after embed:\n{final_status['stdout']}")
+                if qmd_status_has_missing_embeddings(final_status["stdout"]):
+                    return fail(state, "QMD status still reports missing embeddings after embed")
+    return state
+
+
+def path_guard_node(state: RunnerState) -> RunnerState:
+    if state.get("stop"):
+        return state
+    slug = state.get("slug")
+    if not slug:
+        return fail(state, "no slug available for path guard")
+    try:
+        status_now = git_status_paths()
+    except Exception as exc:
+        return fail(state, str(exc))
+    introduced_paths = status_now - state.get("status_before", set())
+    violations = sorted(
+        path
+        for path in introduced_paths
+        if not is_allowed_path(
+            path,
+            slug,
+            state.get("event_log_dir", EVENT_LOG_DIR.as_posix()),
+            state.get("quality_review", False),
+        )
+    )
+    if violations:
+        return fail(state, "path-scope violation:\n" + "\n".join(f"- {path}" for path in violations))
+    append_log(state, f"Path guard passed for {slug}.")
+    state["completed"] = state.get("completed", 0) + 1
+    state["slug"] = None
+    return state
+
+
+def summarize_node(state: RunnerState) -> RunnerState:
+    if state.get("dry_run"):
+        if state.get("queue_before"):
+            print("Dry-run: Codex will ingest the first queued slug from `ingest-order.md`.")
+        else:
+            print("Dry-run: ingest queue is empty.")
+        for line in state.get("logs", []):
+            if line.startswith(("JSONL event logging", "Codex event summaries", "Source quality review")):
+                print(line)
+        for command in state.get("planned_commands", []):
+            print(f"- {command_for_display(command)}")
+        return state
+    for line in state.get("logs", []):
+        print(line)
+    for event_log in state.get("event_logs", []):
+        print(f"Event log: {event_log}")
+    if state.get("error"):
+        print(state["error"], file=sys.stderr)
+    else:
+        print(f"Completed {state.get('completed', 0)} ingest(s).")
+    return state
+
+
+def should_continue_after_guard(state: RunnerState) -> str:
+    if state.get("error") or state.get("completed", 0) >= state["limit"]:
+        return "summarize"
+    return "read_queue"
+
+
+def route_after_read_queue(state: RunnerState) -> str:
+    if state.get("stop"):
+        return "summarize"
+    return "run_codex_ingest"
+
+
+def route_after_step(state: RunnerState, next_node: str) -> str:
+    if state.get("stop") or state.get("error"):
+        return "summarize"
+    return next_node
+
+
+def build_graph() -> object:
+    StateGraph, END = import_langgraph()
+    graph = StateGraph(RunnerState)
+    graph.add_node("read_queue", read_queue_node)
+    graph.add_node("run_codex_ingest", run_codex_ingest_node)
+    graph.add_node("run_checks", run_checks_node)
+    graph.add_node("refresh_qmd", refresh_qmd_node)
+    graph.add_node("path_guard", path_guard_node)
+    graph.add_node("summarize", summarize_node)
+    graph.set_entry_point("read_queue")
+    graph.add_conditional_edges(
+        "read_queue",
+        route_after_read_queue,
+        {"summarize": "summarize", "run_codex_ingest": "run_codex_ingest"},
+    )
+    graph.add_conditional_edges(
+        "run_codex_ingest",
+        lambda state: route_after_step(state, "run_checks"),
+        {"summarize": "summarize", "run_checks": "run_checks"},
+    )
+    graph.add_conditional_edges(
+        "run_checks",
+        lambda state: route_after_step(state, "refresh_qmd"),
+        {"summarize": "summarize", "refresh_qmd": "refresh_qmd"},
+    )
+    graph.add_conditional_edges(
+        "refresh_qmd",
+        lambda state: route_after_step(state, "path_guard"),
+        {"summarize": "summarize", "path_guard": "path_guard"},
+    )
+    graph.add_conditional_edges(
+        "path_guard",
+        should_continue_after_guard,
+        {"summarize": "summarize", "read_queue": "read_queue"},
+    )
+    graph.add_edge("summarize", END)
+    return graph.compile()
+
+
+def main(argv: list[str]) -> int:
+    args = parse_args(argv)
+    if args.limit < 1:
+        print("--limit must be at least 1", file=sys.stderr)
+        return 2
+    os.chdir(REPO_ROOT)
+    try:
+        with singleton_runner_lock():
+            app = build_graph()
+            final_state = app.invoke(
+                {
+                    "repo_root": str(REPO_ROOT),
+                    "limit": args.limit,
+                    "model": args.model,
+                    "quality_review": args.quality_review,
+                    "dry_run": args.dry_run,
+                    "event_log": args.event_log,
+                    "event_log_dir": args.event_log_dir,
+                    "event_summary": args.event_summary,
+                    "completed": 0,
+                    "logs": [],
+                    "planned_commands": [],
+                    "event_logs": [],
+                    "error": None,
+                    "stop": False,
+                }
+            )
+    except RunnerLockBusy as exc:
+        print(exc, file=sys.stderr)
+        return RUNNER_LOCK_BUSY_EXIT_CODE
+    return 1 if final_state.get("error") else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

@@ -1,0 +1,22 @@
+{
+  "source_id": "example-source-slug",
+  "title": "Example Source Title",
+  "raw_dir": "raw/example-source-slug",
+  "agent_dir": "agent/example-source-slug",
+  "main_file": "source.md",
+  "source_files": [
+    {
+      "role": "paper",
+      "path": "raw/example-source-slug/paper.pdf",
+      "type": "pdf"
+    }
+  ],
+  "has_images": false,
+  "has_refs": true,
+  "language": "en",
+  "source_type": "paper",
+  "processing": {
+    "status": "draft",
+    "updated": "2026-04-25"
+  }
+}

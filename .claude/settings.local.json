@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "qmd-wiki": {
+      "command": "./scripts/qmd-wiki",
+      "args": [
+        "mcp"
+      ]
+    }
+  },
+  "permissions": {
+    "allow": [
+      "Bash(python3 *)"
+    ]
+  }
+}
